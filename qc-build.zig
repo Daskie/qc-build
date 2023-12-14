@@ -1,25 +1,42 @@
 const std = @import("std");
 
-pub fn addModule(b: *std.Build, comptime Module: type) void
+pub fn init(b: *std.Build) void
+{
+    _init(b);
+}
+
+pub fn addModule(comptime Module: type) void
 {
     if (!_initialized)
     {
-        _init(b);
+        _error("Uninitialized", .{});
     }
 
-    const info = _ModuleInfo{
-        .name = Module.name,
-        .deps = Module.deps,
-        .cFiles = Module.cFiles};
+    var info = _ModuleInfo{};
 
-    _modules.putNoClobber(info.name, info) catch @panic("");
+    inline for (comptime @typeInfo(Module).Struct.decls) |field|
+    {
+        if (comptime @hasDecl(Module, field.name)) @field(info, field.name) = @field(Module, field.name);
+    }
+
+    if (info.name.len == 0)
+    {
+        _error("Module file `{s}` is missing name", .{@typeName(Module)});
+    }
+
+    _modules.putNoClobber(info.name, info)
+        catch _error("Duplicate module `{s}`", .{info.name});
 }
 
 pub fn buildTests(moduleName: []const u8) void
 {
-    if (!_initialized) @panic("");
+    if (!_initialized)
+    {
+        _error("Uninitialized", .{});
+    }
 
-    const info = _modules.getPtr(moduleName) orelse @panic("");
+    const info = _modules.getPtr(moduleName)
+        orelse _error("Module `{s}` not found", .{moduleName});
 
     const tests = _b.addTest(.{
         .name = _createTestsName(info.name),
@@ -35,7 +52,7 @@ pub fn buildTests(moduleName: []const u8) void
 
     _linkDeps(tests, info.deps);
 
-    _linkCFiles(tests, info.cFiles, info.name);
+    _linkCFilesAndLibs(tests, info.cFiles, info.cLibs, info.name);
 
     const installTests = _b.addInstallArtifact(tests, .{});
 
@@ -44,9 +61,12 @@ pub fn buildTests(moduleName: []const u8) void
     testsStep.dependOn(&installTests.step);
 }
 
-pub fn buildExe(source: []const u8, deps: []const []const u8, cFiles: []const []const u8) void
+pub fn buildExe(source: []const u8, deps: []const []const u8, cFiles: []const []const u8, cLibs: []const []const u8) void
 {
-    if (!_initialized) @panic("");
+    if (!_initialized)
+    {
+        _error("Uninitialized", .{});
+    }
 
     const exe = _b.addExecutable(.{
         .name = std.fs.path.stem(source),
@@ -63,7 +83,7 @@ pub fn buildExe(source: []const u8, deps: []const []const u8, cFiles: []const []
 
     _linkDeps(exe, deps);
 
-    _linkCFiles(exe, cFiles, null);
+    _linkCFilesAndLibs(exe, cFiles, cLibs, null);
 
     // Install exe on default `zig build`
     _b.installArtifact(exe);
@@ -73,9 +93,10 @@ pub fn buildExe(source: []const u8, deps: []const []const u8, cFiles: []const []
 
 pub const _ModuleInfo = struct
 {
-    name: []const u8,
-    deps: []const []const u8,
-    cFiles: []const []const u8
+    name: []const u8 = &.{},
+    deps: []const []const u8 = &.{},
+    cFiles: []const []const u8 = &.{},
+    cLibs: []const []const u8 = &.{}
 };
 
 const _debugCFlags = [_][]const u8{"-O0", "-g"};
@@ -86,9 +107,20 @@ var _b: *std.Build = undefined;
 var _target: std.zig.CrossTarget = undefined;
 var _optimize: std.builtin.OptimizeMode = undefined;
 var _modules: std.StringHashMap(_ModuleInfo) = undefined;
+var _errorBuffer: [1024]u8 = undefined;
+
+fn _error(comptime fmt: []const u8, args: anytype) noreturn
+{
+    @panic(std.fmt.bufPrint(&_errorBuffer, fmt, args) catch unreachable);
+}
 
 fn _init(b: *std.Build) void
 {
+    if (_initialized)
+    {
+        _error("Already initialized", .{});
+    }
+
     _b = b;
 
     _target = _b.standardTargetOptions(.{});
@@ -103,7 +135,8 @@ fn _linkDeps(exe: *std.Build.Step.Compile, deps: []const []const u8) void
 {
     for (deps) |dep|
     {
-        const depModule: *_ModuleInfo = _modules.getPtr(dep) orelse @panic("");
+        const depModule: *_ModuleInfo = _modules.getPtr(dep)
+            orelse _error("Do not have dependency `{s}`", .{dep});
 
         // Don't link same dependency twice
         if (!exe.modules.contains(depModule.name))
@@ -111,25 +144,42 @@ fn _linkDeps(exe: *std.Build.Step.Compile, deps: []const []const u8) void
             // Link subdependencies recursively
             _linkDeps(exe, depModule.deps);
 
-            _linkCFiles(exe, depModule.cFiles, depModule.name);
+            _linkCFilesAndLibs(exe, depModule.cFiles, depModule.cLibs, depModule.name);
         }
     }
 }
 
-fn _linkCFiles(exe: *std.Build.Step.Compile, cFiles: []const []const u8, module: ?[]const u8) void
+fn _linkCFilesAndLibs(exe: *std.Build.Step.Compile, cFiles: []const []const u8, cLibs: []const []const u8, module: ?[]const u8) void
 {
-    if (cFiles.len > 0)
+    if (cFiles.len > 0 or cLibs.len > 0)
     {
-       // Link with libc if has any C source files
-        exe.linkSystemLibrary("c");
+        exe.linkLibC();
 
-        // Add C source files
-        for (cFiles) |cFile|
-        {
-            exe.addCSourceFile(std.build.CompileStep.CSourceFile{
-                .file = std.build.LazyPath{.path = if (module) |m| _createCFilePath(m, cFile) else cFile},
-                .flags = if (_optimize == std.builtin.OptimizeMode.Debug) &_debugCFlags else &_releaseCFlags});
-        }
+        // Explicitly link the shared library version of libc to force shared libc linkage
+        // TODO: Remove once have ability to request shared linkage of libc directly
+        exe.linkSystemLibrary(
+            switch (_target.os_tag.?)
+            {
+                .windows => "msvcrt",
+                else => @panic("") // TODO
+            });
+
+        // Add module root as include dir
+        exe.addIncludePath(std.build.LazyPath{.path = _getModuleRootPath(module)});
+    }
+
+    // Add C source files
+    for (cFiles) |file|
+    {
+        exe.addCSourceFile(std.build.CompileStep.CSourceFile{
+            .file = std.build.LazyPath{.path = _getModuleFilePath(module, file)},
+            .flags = if (_optimize == std.builtin.OptimizeMode.Debug) &_debugCFlags else &_releaseCFlags});
+    }
+
+    // Add C libs
+    for (cLibs) |lib|
+    {
+        exe.addObjectFile(std.build.LazyPath{.path = _getModuleFilePath(module, lib)});
     }
 }
 
@@ -145,8 +195,28 @@ fn _createSourcePath(name: []const u8) []const u8
     return std.mem.concat(_b.allocator, u8, &.{"modules/", name, "/", name, ".zig"}) catch unreachable;
 }
 
-fn _createCFilePath(module: []const u8, cFile: []const u8) []const u8
+fn _getModuleRootPath(module_: ?[]const u8) []const u8
 {
-    // Intentionally leaking memory
-    return std.mem.concat(_b.allocator, u8, &.{"modules/", module, "/", cFile}) catch unreachable;
+    if (module_) |module|
+    {
+        // Intentionally leaking memory
+        return std.mem.concat(_b.allocator, u8, &.{"modules/", module}) catch unreachable;
+    }
+    else
+    {
+        return ".";
+    }
+}
+
+fn _getModuleFilePath(module_: ?[]const u8, file: []const u8) []const u8
+{
+    if (module_) |module|
+    {
+        // Intentionally leaking memory
+        return std.mem.concat(_b.allocator, u8, &.{"modules/", module, "/", file}) catch unreachable;
+    }
+    else
+    {
+        return file;
+    }
 }
