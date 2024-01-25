@@ -50,6 +50,8 @@ pub fn buildTests(moduleName: []const u8) void
         tests.strip = true;
     }
 
+    tests.addOptions("qc-build-options", _options);
+
     _linkDeps(tests, info.deps);
 
     _linkCFilesAndLibs(tests, info.cFiles, info.cLibs, info.name);
@@ -81,6 +83,8 @@ pub fn buildExe(source: []const u8, deps: []const []const u8, cFiles: []const []
         exe.strip = true;
     }
 
+    exe.addOptions("qc-build-options", _options);
+
     _linkDeps(exe, deps);
 
     _linkCFilesAndLibs(exe, cFiles, cLibs, null);
@@ -107,6 +111,7 @@ var _b: *std.Build = undefined;
 var _target: std.zig.CrossTarget = undefined;
 var _optimize: std.builtin.OptimizeMode = undefined;
 var _modules: std.StringHashMap(_ModuleInfo) = undefined;
+var _options: *std.build.Step.Options = undefined;
 var _errorBuffer: [1024]u8 = undefined;
 
 fn _error(comptime fmt: []const u8, args: anytype) noreturn
@@ -127,6 +132,15 @@ fn _init(b: *std.Build) void
     _optimize = _b.standardOptimizeOption(.{});
 
     _modules = std.StringHashMap(_ModuleInfo).init(_b.allocator);
+
+    // Init options
+    _options = _b.addOptions();
+    if (_optimize == .Debug or _optimize == .ReleaseSafe)
+    {
+        // Absolute path to the root project directory
+        // Used so `assert` can print an absolute source path, amonst other things
+        _options.addOption([]const u8, "rootDir", _b.build_root.path.?);
+    }
 
     _initialized = true;
 }
