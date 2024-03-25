@@ -2,7 +2,39 @@ const std = @import("std");
 
 pub fn init(b: *std.Build) void
 {
-    _init(b);
+    if (_initialized)
+    {
+        _error("Already initialized", .{});
+    }
+
+    _b = b;
+
+    _target = _b.standardTargetOptions(.{});
+    _optimize = _b.standardOptimizeOption(.{});
+
+    // Get build mode from build-time args
+    {
+        const buildModeOpt = _b.option(_BuildMode, "qc-build-mode", "Whether to build in devel or release mode");
+        _buildMode = buildModeOpt orelse @panic("Missing `qc-build-mode` build option");
+    }
+
+    _modules = std.StringHashMap(_ModuleInfo).init(_b.allocator);
+
+    // Init build options
+    {
+        _options = _b.addOptions();
+
+        _options.addOption([]const u8, "mode", @tagName(_buildMode));
+
+        if (_buildMode == .devel)
+        {
+            // Absolute path to the root project directory
+            // Used so `assert` can print an absolute source path, amonst other things
+            _options.addOption([]const u8, "rootDir", _b.build_root.path.?);
+        }
+    }
+
+    _initialized = true;
 }
 
 pub fn addModule(comptime Module: type) void
@@ -72,7 +104,7 @@ pub fn buildExe(source: []const u8, deps: []const []const u8, cFiles: []const []
 
     const exe = _b.addExecutable(.{
         .name = std.fs.path.stem(source),
-        .root_source_file = .{ .path = source },
+        .root_source_file = std.Build.LazyPath{.path = source},
         .target = _target,
         .optimize = _optimize,
         .main_pkg_path = std.build.LazyPath{.path = "."}});
@@ -95,6 +127,8 @@ pub fn buildExe(source: []const u8, deps: []const []const u8, cFiles: []const []
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
+const _BuildMode = enum { devel, release };
+
 pub const _ModuleInfo = struct
 {
     name: []const u8 = &.{},
@@ -110,6 +144,7 @@ var _initialized: bool = false;
 var _b: *std.Build = undefined;
 var _target: std.zig.CrossTarget = undefined;
 var _optimize: std.builtin.OptimizeMode = undefined;
+var _buildMode: _BuildMode = undefined;
 var _modules: std.StringHashMap(_ModuleInfo) = undefined;
 var _options: *std.build.Step.Options = undefined;
 var _errorBuffer: [1024]u8 = undefined;
@@ -117,32 +152,6 @@ var _errorBuffer: [1024]u8 = undefined;
 fn _error(comptime fmt: []const u8, args: anytype) noreturn
 {
     @panic(std.fmt.bufPrint(&_errorBuffer, fmt, args) catch unreachable);
-}
-
-fn _init(b: *std.Build) void
-{
-    if (_initialized)
-    {
-        _error("Already initialized", .{});
-    }
-
-    _b = b;
-
-    _target = _b.standardTargetOptions(.{});
-    _optimize = _b.standardOptimizeOption(.{});
-
-    _modules = std.StringHashMap(_ModuleInfo).init(_b.allocator);
-
-    // Init options
-    _options = _b.addOptions();
-    if (_optimize == .Debug or _optimize == .ReleaseSafe)
-    {
-        // Absolute path to the root project directory
-        // Used so `assert` can print an absolute source path, amonst other things
-        _options.addOption([]const u8, "rootDir", _b.build_root.path.?);
-    }
-
-    _initialized = true;
 }
 
 fn _linkDeps(exe: *std.Build.Step.Compile, deps: []const []const u8) void
